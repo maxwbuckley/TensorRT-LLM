@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import enum
+import math
 import os
 from collections import Counter
 from typing import Callable, Optional
@@ -237,6 +238,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             scheduler_policy = CapacitySchedulerPolicy.MAX_UTILIZATION
         self.policy = scheduler_policy
         self.peft_cache_manager = peft_cache_manager
+
+        # Replay reservation without chunked prefill (_admits_within_replay_reservation);
+        # reset at the start of every scheduling pass.
+        self._replay_reserved_blocks: Optional[int] = None
+        self._replay_reservation_requests: dict[int, LlmRequest] = {}
 
         # Chunking config.
         self.chunking_enabled = False
@@ -493,6 +499,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         disagg_candidates: RequestList = []
         scheduled_beam_width = 0
         has_chunking = False
+        # Replay reservation (_admits_within_replay_reservation): computed lazily, once per pass.
+        self._replay_reserved_blocks = None
+        self._replay_reservation_requests = {r.py_request_id: r for r in active_requests}
 
         budget = BudgetTracker(
             self.max_num_tokens,
@@ -1351,6 +1360,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             ), (
                 f"Context tokens ({pre_prepare_context_tokens}) exceeds limit ({self.max_context_length})"
             )
+        if not self._admits_within_replay_reservation(req):
+            return ScheduleAction.STOP, 0, False
 
         # Prepare first so block reuse updates context_remaining_length
         # before budget check.
@@ -2381,6 +2392,23 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "Configure kv_cache_config.host_cache_size, increase "
                 "kv_cache_config.max_tokens, or lower max_batch_size."
             )
+        cause = "The KV cache pool is likely exhausted."
+        too_long = [
+            r.py_request_id
+            for r in pending_ctx
+            if not self.chunking_enabled
+            and self.max_num_tokens is not None
+            and r.context_remaining_length + get_draft_token_length(r) > self.max_num_tokens
+        ]
+        if too_long:
+            cause = (
+                f"Context request(s) {too_long[:8]} need more than "
+                f"max_num_tokens={self.max_num_tokens} tokens in one iteration and "
+                f"chunked prefill is off, so they can never be scheduled."
+            )
+            remedy = (
+                "Enable chunked prefill (enable_chunked_prefill=True) or increase max_num_tokens."
+            )
         # Logged before the raise so the diagnostic survives even if the
         # exception is caught or truncated upstream.
         logger.warning(
@@ -2392,8 +2420,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"V2 scheduler deadlock: {num_gen_candidates} generation and "
             f"{num_ctx_candidates} context request(s) active but none could "
             f"be scheduled, suspended or preempted in "
-            f"{self._stalled_schedules} consecutive attempts. The KV cache "
-            f"pool is likely exhausted. {remedy}"
+            f"{self._stalled_schedules} consecutive attempts. {cause} {remedy}"
         )
 
     def _summarize_stall(
@@ -2474,7 +2501,77 @@ class KVCacheV2Scheduler(RequestScheduler):
         # the durable marker. Partial-context requests still retain replay data.
         if req.is_generation_in_progress_state and req.py_multimodal_data is not None:
             return False
-        return self._is_started_request(req)
+        return self._is_started_request(req) and self._replay_fits(req)
+
+    # ---- Replay limit without chunked prefill ----
+
+    def _replay_fits(self, req: LlmRequest, num_tokens: Optional[int] = None) -> bool:
+        """Whether *req* could be re-prefilled in one iteration after a recompute-pause.
+
+        Recompute-pause replays the prompt plus every generated token as one
+        context. Without chunked prefill that context must fit in
+        ``max_num_tokens``; otherwise ``_try_schedule_context_full`` returns
+        STOP for it on every pass, and every context request queued behind it
+        waits forever.
+        """
+        if self.chunking_enabled or self.max_num_tokens is None:
+            return True
+        n = req.get_num_tokens(0) if num_tokens is None else num_tokens
+        return n + get_draft_token_length(req) <= self.max_num_tokens
+
+    def _may_outgrow_replay(self, req: LlmRequest) -> bool:
+        """Whether *req* can reach a length at which ``_replay_fits`` is False."""
+        # prompt_len + max_new_tokens is unchanged by a pause; the last token is never replayed.
+        return not self._replay_fits(req, req.prompt_len + req.max_new_tokens - 1)
+
+    def _worst_case_blocks(self, req: LlmRequest) -> int:
+        return math.ceil((req.prompt_len + req.max_new_tokens + 1) / self.tokens_per_block)
+
+    def _replay_reservation_blocks(self) -> int:
+        """Pages the requests holding a KV cache may need: the worst case of those that
+        may outgrow their replay (they cannot be preempted once they do), the current
+        capacity of every other one (they stay preemptible)."""
+        by_id = self._replay_reservation_requests
+        total = 0
+        for request_id, kv_cache in self.kv_cache_manager.kv_cache_map.items():
+            blocks = math.ceil(max(int(kv_cache.capacity), 0) / self.tokens_per_block)
+            req = by_id.get(request_id)
+            if req is not None and self._may_outgrow_replay(req):
+                blocks = max(blocks, self._worst_case_blocks(req))
+            total += blocks
+        return total
+
+    def _admits_within_replay_reservation(self, req: LlmRequest) -> bool:
+        """Admission control for requests that recompute-pause will not be able to preempt.
+
+        Without chunked prefill and without a cache tier below GPU, a request
+        that has outgrown its replay can neither be preempted (``_replay_fits``)
+        nor suspended to free pages. Admit a new context only if the worst case
+        of every such request, the current pages of the rest and this request's
+        own need fit in the pool, so a growing request can always get pages by
+        preempting the preemptible ones. With chunked prefill or a host tier
+        this is a no-op.
+        """
+        if self.chunking_enabled or self.max_num_tokens is None:
+            return True
+        kv_cache_manager = self.kv_cache_manager
+        if (
+            kv_cache_manager.has_cache_tier_below_gpu
+            or not req.is_first_context_chunk
+            or req.py_request_id in kv_cache_manager.kv_cache_map
+        ):
+            return True
+        if self._replay_reserved_blocks is None:
+            self._replay_reserved_blocks = self._replay_reservation_blocks()
+        if self._may_outgrow_replay(req):
+            need = self._worst_case_blocks(req)
+        else:
+            need = math.ceil(req.get_num_tokens(0) / self.tokens_per_block)
+        pool_blocks = kv_cache_manager.get_kv_cache_stats().max_num_blocks
+        if self._replay_reserved_blocks + need > pool_blocks:
+            return False
+        self._replay_reserved_blocks += need
+        return True
 
     def _preempt_or_defer(self, req: LlmRequest, recompute_paused: RequestList) -> bool:
         """Give up *req*'s pages for another request, if they are free to give.

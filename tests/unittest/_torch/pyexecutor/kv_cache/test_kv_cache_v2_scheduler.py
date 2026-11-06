@@ -366,6 +366,10 @@ def make_gen_request(
     req.is_first_context_chunk = is_first_context_chunk
     req.py_encoder_output_ready_event = None
     req.py_multimodal_data = None
+    # Integer lengths, as on a real LlmRequest: recompute-pause checks the replay length.
+    req.prompt_len = 8
+    req.max_new_tokens = 8
+    req.get_num_tokens.return_value = 9
     return req
 
 
@@ -402,6 +406,8 @@ def make_ctx_request(
     req.py_encoder_output_ready_event = None
     req.py_skip_cross_kv_projection = False
     req.py_ctx_sched_since_iter = None
+    req.max_new_tokens = 1
+    req.get_num_tokens.return_value = req.prompt_len
     return req
 
 
@@ -607,6 +613,7 @@ class _KVCacheMap(dict):
     def __missing__(self, key):
         entry = Mock()
         entry.is_active = True
+        entry.capacity = 0
         self[key] = entry
         return entry
 
@@ -683,6 +690,9 @@ def make_kv_cache_manager(
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
     # The default here has a cache tier below GPU, which leaves preemption off.
     mgr.has_cache_tier_below_gpu = has_cache_tier_below_gpu
+    # Pool size for the replay reservation without a lower tier; large enough
+    # that it never binds unless a test sets it.
+    mgr.get_kv_cache_stats.return_value = SimpleNamespace(max_num_blocks=1 << 30)
 
     def preempt_request(req):
         """Release the pages now, as the real one does with no connector.
@@ -2479,6 +2489,72 @@ class TestPreemptionDefersToConnectorSaves:
         reqs = [make_gen_request(0), victim]
 
         for _ in range(10):
+            sched.schedule_request(reqs, set())
+
+
+class TestReplayLimitWithoutChunking:
+    """Recompute-pause replays prompt + generated tokens as one context.
+
+    Without chunked prefill a replay longer than max_num_tokens can never be
+    scheduled; it used to block every context queued behind it until the
+    deadlock detector fired with an empty pool.
+    """
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_request_whose_replay_cannot_fit_is_not_a_pause_victim(self, chunked):
+        sched = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=1024,
+            ctx_chunk_config=(None, 64) if chunked else None,
+        )
+        fits, too_long = make_gen_request(0), make_gen_request(1)
+        fits.get_num_tokens.return_value = 1024
+        too_long.get_num_tokens.return_value = 1025
+
+        assert sched._is_recompute_pause_candidate(fits, set())
+        # With chunked prefill a replay of any length can be scheduled.
+        assert sched._is_recompute_pause_candidate(too_long, set()) is chunked
+
+    @staticmethod
+    def _outgrowing_ctx(request_id):
+        # 200 + 200 > max_num_tokens=256: once it has generated enough it can't be preempted.
+        req = make_ctx_request(request_id, 200)
+        req.max_new_tokens = 200
+        return req
+
+    def test_admission_reserves_worst_case_without_lower_tier(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64, has_cache_tier_below_gpu=False)
+        mgr.get_kv_cache_stats.return_value = SimpleNamespace(max_num_blocks=10)
+        sched = make_scheduler(mgr, max_num_tokens=256)
+
+        # Worst case ceil((200 + 200 + 1) / 64) = 7 blocks each: one fits a 10-block pool, two don't.
+        assert sched._admits_within_replay_reservation(self._outgrowing_ctx(0))
+        assert not sched._admits_within_replay_reservation(self._outgrowing_ctx(1))
+        # A request that can always be replayed only needs its current pages (2 blocks).
+        assert sched._admits_within_replay_reservation(make_ctx_request(2, 100))
+
+    @pytest.mark.parametrize(
+        "lower_tier, chunked", [(True, False), (False, True)], ids=["host_tier", "chunked"]
+    )
+    def test_admission_is_unchanged_with_a_lower_tier_or_chunking(self, lower_tier, chunked):
+        mgr = make_kv_cache_manager(tokens_per_block=64, has_cache_tier_below_gpu=lower_tier)
+        mgr.get_kv_cache_stats.return_value = SimpleNamespace(max_num_blocks=10)
+        sched = make_scheduler(
+            mgr, max_num_tokens=256, ctx_chunk_config=(None, 64) if chunked else None
+        )
+
+        assert all(
+            sched._admits_within_replay_reservation(self._outgrowing_ctx(i)) for i in range(4)
+        )
+
+    def test_deadlock_names_context_that_cannot_fit_without_chunking(self):
+        sched = make_scheduler(make_kv_cache_manager(), max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        reqs = [make_ctx_request(0, 1200, is_first_context_chunk=False)]
+
+        for _ in range(2):
+            sched.schedule_request(reqs, set())
+        with pytest.raises(RuntimeError, match="chunked prefill is off"):
             sched.schedule_request(reqs, set())
 
 
